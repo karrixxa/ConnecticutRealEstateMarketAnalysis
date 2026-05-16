@@ -1,0 +1,1453 @@
+---
+title: "Real Estate Sales in Connecticut (2001-2023)"
+author: "JC Cheng, Charis Xiong, Rahul Santhanam, Kyle Leung"
+format:
+  pdf_document: default
+output: pdf_document
+geometry: margin=1in
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+# I: Introduction to Data
+
+The Connecticut real estate market has experienced significant changes over the past two decades, influenced by economic trends, demographic changes, and municipal assessment practices. This project will investigate real estate sales data from 2001 and 2023 to explore how the market has developed.
+
+By analyzing property sales across towns, property types, and time periods, we aim to understand how the housing market has evolved and how assessed values compare to actual market outcomes.
+
+Our study provides insights into long-term trends, the reliability of municipal assessments, and the differences in pricing dynamics across residential and commercial properties.
+
+## Research Question
+
+**How have real estate prices and municipal assessments in Connecticut changed from 2001 to 2023, and what do these patterns reveal about market trends across time, property types, and towns?**
+
+### Key Hypotheses
+
+Based on Connecticut’s practice of revaluing properties every 5–10 years, we expect:
+
+**H1 (Timing):** Assessment accuracy will worsen during volatile market periods (the 2008–2012 housing crisis and the 2020+ post-COVID boom), because assessments cannot keep pace with rapid price swings.
+
+**H2 (Distribution):** High-value properties will show a weaker assessment–price relationship than low-value properties, indicating potential under-assessment of expensive homes.
+
+### Supporting Questions
+
+-   What long-term price trends can be observed in Connecticut's real estate market?
+-   How do major events (the 2008 housing crisis/ COVID-19 pandemic) show up in the data?
+-   How closely do municipal assessed values match actual sale prices?
+-   How do sales differ between residential, commercial, industrial, apartment, and vacant properties?
+
+## Sources
+
+The dataset comes from the Connecticut Open Data Portal, titled *Real Estate Sales 2001–2023 (GL)*.
+It contains all property transactions of \$2,000 or greater, reported annually by each municipality in Connecticut as required by state statute.
+Each record includes information such as the sale amount, assessed value, property type, and town, which allows us to analyze pricing trends, assessment accuracy, and differences across locations and property categories.
+
+One of the supplementary datasets comes from the Connecticut Open Data Portal, titled *CT 2020 Population Projections by Town*.
+It contains projections of the population in Connecticut are created based on multiple data sources, but the actual population changes may vary from these projections.
+To assist in planning, analysis, and decision making, the population projections have been developed based on state and locally derived fertility rates.
+
+The other supplementary dataset comes from the Connecticut Open Data Portal, titled *Personal Income Tax by Town (2011–2020)*.
+This dataset provides annual information on municipal income tax filings and collections across all towns in Connecticut.
+
+## Variables
+
+| **Data Source** | **Variable** | **Description** |
+|:-----------------------|:-----------------------|:-----------------------|
+| **Real Estate Sales** | List Year | Year property was listed for sale. |
+|  | Date Recorded | Date transaction was officially recorded. |
+|  | Town | Municipality of the sale. |
+|  | Assessed Value | Local tax assessment value. |
+|  | Sale Amount | Actual sale price. |
+|  | Sales Ratio | Ratio: Sale Amount / Assessed Value (Accuracy measure). |
+|  | Property Type | Category (e.g., Commercial, Industrial, Vacant). |
+|  | Residential Type | Type of residential property (Single/Multi-family). |
+|  | OPM/Assessor Remarks | Transaction notes (e.g., foreclosure, new construction). |
+| **Population Projections** | Total | Projected total population in 2020. |
+| **Personal Income Tax** | Tax.Year | Income year for tax data. |
+|  | Number.of.Returns | Total individual tax returns filed. |
+|  | CT.Income.Tax | Total CT state income tax collected. |
+|  | Income.Tax | Average income tax per return (Proxy for local income level). |
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# Packages
+# install.packages("vioplot")
+library("scales")
+library("vioplot")
+library("ggplot2")
+library("tidyverse")
+library("forcats")
+library("viridisLite")
+library("RColorBrewer")
+library("RSQLite")
+library("DBI")
+library("tidytext")
+library("stringr")
+library("tidyr")
+theme_set(theme_minimal(base_size = 10))
+master_palette <- brewer.pal(8, "Set2")
+res_palette    <- setNames(master_palette[1:5], c("Condo", "Four Family", "Single Family", "Three Family", "Two Family"))
+
+prop_palette   <- setNames(master_palette[1:4], c("Commercial", "Two Family", "Single Family", "Apartments"))
+
+town_palette   <- colorRampPalette(master_palette)(20)  
+# (for bubble charts, slope charts, heatmaps with many towns)
+
+tx_palette <- setNames(master_palette[3:5],  c("Foreclosure", "Short Sale", "Bank Owned"))
+
+```
+
+## Pre-Processing Methods and Data Cleaning
+
+All preprocessing was performed directly within SQLite using SQL queries to ensure reproducibility and efficient handling of large datasets. Below outlines the key SQL-based data cleaning and transformation steps for each table.
+
+### From *Real Estate Sales 2001–2023 (GL)*
+We removed incomplete records, dropping any rows missing critical information such as Sale Amount or Assessed Value, since these variables are essential for the main analysis. We retained the Assessor Remarks and OPM Remarks fields, using text mining to classify transaction types (e.g., foreclosure, short sale, new construction) based on keywords. Other low-value variables such as Serial Number and Non Use Code were removed due to limited analytical relevance or excessive missing data. We reformatted the Date.Recorded variable (originally in MM/DD/YYYY) into YYYY-MM-DD using string extraction functions for temporal analysis. We filtered out rows with missing Property Type and removed the top 1% of Sales.Ratio values to reduce the influence of extreme outliers.
+
+### From *CT 2020 Population Projections by Town*
+We renamed the column X2020.TOTAL to Population and coerced it to numeric. We removed invalid or missing Town entries and rows with zero population, applied regular expressions in R to clean Town names, and merged this dataset with the cleaned Real Estate Sales 2001–2023 (GL) table.
+From Personal Income Tax By Town, 2011–2020
+
+### From *Personal Income Tax By Town, 2011–2020*
+We renamed Municipality to Town for consistency across datasets and trimmed whitespace. We removed unnecessary columns unrelated to income-level analysis (e.g., redundant identifiers) and coerced CT.Income.Tax and Number.of.Returns to numeric data types to allow calculations. We created a new variable Income.Tax, computed as CT.Income.Tax divided by Number.of.Returns, to estimate average income tax per return (proxy for local income levels). We standardized Town name capitalization to match Real Estate Sales 2001–2023 (GL) and merged this dataset with the main real estate dataset by Town and Tax.Year to explore how income patterns relate to housing prices and recovery trends.
+
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+# Import our data through SQLite
+conn <- dbConnect(SQLite(), dbname = "/Users/24kylel/Desktop/STAT 405 Final Presentation/CT_Real_Estate.sqlite 2")
+initExtension(conn)
+
+data <- dbReadTable(conn, "real_estate_sales")
+population  <- dbReadTable(conn, "population_2020")
+income <- dbReadTable(conn, "personal_income_tax")
+
+```
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+
+pop <- dbReadTable(conn, "population_2020")
+
+pop <- subset(pop, !is.na(Town) & trimws(Town) != "")
+pop <- subset(pop, !is.na(X2020.TOTAL) & X2020.TOTAL != 0)
+
+#regex
+pop$Town <- gsub("\\s*\\([^)]*\\)", "", pop$Town)
+pop$Town <- gsub(",\\s*[A-Z]{2}$", "", pop$Town)
+pop$Town <- gsub("[^A-Za-z\\s]", "", pop$Town)
+pop$Town <- tools::toTitleCase(tolower(trimws(pop$Town)))
+
+pop$Population <- as.numeric(pop$X2020.TOTAL)
+
+dbWriteTable(conn, "population_tidy", pop[, c("Town", "Population")], overwrite = TRUE)
+```
+
+```{r }
+invisible(dbExecute(conn, "DROP TABLE IF EXISTS data_clean;"))
+
+invisible(dbExecute(conn, '
+CREATE TABLE data_clean AS
+WITH base AS (
+  SELECT
+    -- reformat date
+    SUBSTR(`Date Recorded`, 7, 4) || "-" || 
+    SUBSTR(`Date Recorded`, 1, 2) || "-" || 
+    SUBSTR(`Date Recorded`, 4, 2) AS Date_Recorded,
+    -- keep List Year as an integer
+    CAST(`List Year` AS INTEGER) AS List_Year,
+    Town,
+    Address,
+    `Property Type`   AS Property_Type,
+    CAST(`Sales Ratio` AS REAL) AS Sales_Ratio,
+    `Residential Type` AS Residential_Type,
+    `Sale Amount`      AS Sale_Amount,
+    `Assessed Value`   AS Assessed_Value
+  FROM real_estate_sales
+  WHERE
+    `Sale Amount` IS NOT NULL 
+    AND `Assessed Value` IS NOT NULL
+    AND Town              != "" 
+    AND Address           != "" 
+    AND `Property Type`   != "" 
+    AND `Sales Ratio`     != "" 
+    AND `Residential Type`!= ""
+    AND CAST(`Sales Ratio` AS REAL) > 0
+),
+percentile_calc AS (
+  SELECT 
+    (
+      SELECT Sales_Ratio 
+      FROM base 
+      ORDER BY Sales_Ratio 
+      LIMIT 1 OFFSET (
+        SELECT CAST(COUNT(*) * 0.99 AS INTEGER) 
+        FROM base
+      )
+    ) AS upper_bound
+)
+SELECT b.*
+FROM base b
+CROSS JOIN percentile_calc p
+WHERE b.Sales_Ratio < p.upper_bound;
+'))
+
+```
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+dbExecute(conn, "DROP TABLE IF EXISTS income_clean;")
+
+dbExecute(conn, '
+CREATE TABLE income_clean AS
+SELECT
+  TRIM(LOWER(Municipality)) AS Town,
+  CAST(`CT Income Tax` AS REAL) AS CT_Income_Tax,
+  CAST(`Number of Returns` AS REAL) AS Number_of_Returns,
+  CAST(`CT Income Tax` AS REAL) / CAST(`Number of Returns` AS REAL) AS Income_Tax
+FROM personal_income_tax
+WHERE 
+  `CT Income Tax` IS NOT NULL
+  AND `Number of Returns` IS NOT NULL
+  AND CAST(`CT Income Tax` AS REAL) != 0
+  AND CAST(`Number of Returns` AS REAL) != 0;
+')
+
+# Then apply title case
+dbExecute(conn, '
+UPDATE income_clean 
+SET Town = UPPER(SUBSTR(Town, 1, 1)) || SUBSTR(Town, 2)
+')
+
+dbExecute(conn, "DROP TABLE IF EXISTS df;")
+
+dbExecute(conn, '
+CREATE TABLE df AS
+SELECT
+  d.*,
+  p.Population,
+  i.CT_Income_Tax,
+  i.Number_of_Returns,
+  i.Income_Tax
+FROM data_clean d
+LEFT JOIN population_tidy p
+  ON d.Town = p.Town
+LEFT JOIN income_clean i
+  ON d.Town = i.Town
+;
+')
+
+data_clean <- dbReadTable(conn, "data_clean")
+
+income_clean <- dbReadTable(conn, "income_clean")
+df <- dbReadTable(conn, "df")
+```
+
+# II: Investigating Data
+
+We began by examining key property characteristics such as property type, assessed value, and location to understand how they interact and contribute to housing market trends. In the following sections, we present visual analyses for several core variables.
+
+#### Market Composition: Understanding Connecticut's Housing Market
+
+-   **Mosaic Plot – Distribution of Property Types by City:** We examine the mix of single-family, multifamily, commercial, and apartment properties across Stamford, Bridgeport, and New Haven.
+-   **Lollipop – Median Sale Amount by Town (Top 12):** We rank the twelve most active towns by median sale amount; dots mark each town’s median and stems show distance from zero, highlighting which markets are pricier and how towns compare at a glance.
+-   **Stacked Bar (Counts) – Sales by Property Type in Top Towns** We show the total number of sales in each top town, broken down by property type.
+
+#### Temporal Dynamics: Seasonality, Trends, and Economic Shocks
+
+-   **Heatmap – Seasonality of Sales by Month and Year:** We show the monthly sales intensity by year, darker = more sales, which highlights consistent summer peaks and winter lulls.
+-   **Slope Chart – Great Recession Impact on High-End Markets (2007 vs 2009):** We compare mean house prices in the five most expensive towns before and during the Great Recession.
+-   **Bubble Chart – Post-Crisis Market Structure (2010–2020):** We show how total sales volume, average sale price, and town population relate in the decade after the Great Recession.
+
+#### Assessment Accuracy: Can Municipal Valuations Predict Market Prices?
+
+-   **Scatterplot – Assessed Value vs. Sale Amount:** We examine the relationship between assessed values and sale prices, noting alignment or deviation from equality.
+
+#### Crisis and Boom: Connecticut Housing from 2015 to 2023
+
+-   **Line Plot – Median Sale Price Trends (2015–2023):** Shows how home prices evolved across Connecticut’s largest cities, highlighting sharp post-2020 growth and differences across property types.
+
+### Market Composition: Understanding Connecticut's Housing Market
+
+Before analyzing trends over time, we must first understand the composition of Connecticut's housing market.
+
+##### 1. Mosaic Plot - Distribution of Property Types by City
+
+The data show that single-family homes represent the majority of developments in all three cities, followed by two-family properties, commercial properties, and apartments.
+Stamford stands out as having the largest share of single-family developments, followed by Bridgeport and then New Haven.
+
+The plot reveals an inverse relationship between single-family housing and other property types: cities with higher proportions of single-family homes tend to have fewer apartments, commercial, and multifamily properties.
+This pattern highlights differences in urban land use priorities, Stamford's real estate development is more heavily focused on single-family housing, while New Haven and Bridgeport maintain a somewhat more balanced mix of property types.
+
+This variation in property composition has important implications for local market behavior.Stamford’s concentration of single-family homes makes its housing market more responsive to shifts in household demand and interest rates.
+In contrast, Bridgeport and New Haven have a more varied mix of property types, including commercial and apartment buildings, which attract different kinds of buyers and investors.
+These structural differences help explain how each city’s market reacted to the 2008 financial crisis and the COVID-19 pandemic.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+
+# dbGetQuery(conn, "PRAGMA table_info(df);")
+query <- "
+  SELECT 
+    Town,
+    CASE 
+      WHEN [Property_Type] IN ('Commercial', 'Two Family', 'Single Family', 'Apartments')
+           THEN [Property_Type]
+    END AS Property_Type,
+    COUNT(*) AS n
+  FROM df
+  WHERE Town IN ('Bridgeport', 'New Haven', 'Stamford')
+    AND [Property_Type] IN ('Commercial', 'Two Family', 'Single Family', 'Apartments')
+  GROUP BY Town, Property_Type
+"
+
+df_sql <- dbGetQuery(conn, query)
+df_sql$town <- factor(df_sql$Town)
+df_sql$propertytype <- factor(
+  df_sql$Property_Type,
+  levels = c("Commercial", "Two Family", "Single Family", "Apartments")
+)
+
+# use global prop_palette, aligned to levels
+cols <- prop_palette[levels(df_sql$propertytype)]
+
+# contingency table for mosaicplot
+tab <- xtabs(n ~ propertytype + town, data = df_sql)
+
+mosaicplot(
+  tab,
+  color = cols,
+  xlab = "Property Type", 
+  ylab = "Town",
+  main = "Property Type vs Town in Connecticut"
+)
+
+legend(
+  "right", 
+  legend = levels(df_sql$propertytype),
+  fill = cols,
+  title = "Property Type", 
+  bty = "o",
+  bg = "white"
+)
+
+
+
+```
+
+Understanding property type composition leads naturally to our next question: which towns command the highest prices?
+The lollipop chart below ranks the twelve towns with the most sales by their median sale price over the full 2001-2023 period.
+
+##### 2. Lollipop - Median Sale Amount by Town (Top 12)
+
+This chart ranks the twelve towns with the most sales by their median sale price from 2001–2023.
+Each line shows how high the typical sale is in that town: the dot marks the median and the label gives its value.
+The dashed vertical line shows the statewide median across all sales.
+Towns to the right (Greenwich around \$1.48M, Fairfield around \$575k, Stamford around \$475k, Norwalk around \$417k) have higher typical prices than the state overall, while towns to the left (Waterbury around \$125k, Bridgeport around \$170k, Bristol around \$183k, New Haven around \$195k) fall below the statewide median.
+
+The spread is striking.Greenwich’s median of about \$1,475,000 is nearly twelve times higher than Waterbury’s \$125,000.
+At the top are high-priced Fairfield County markets (Greenwich, Fairfield, Stamford, Norwalk) with medians above \$400,000.
+A middle tier of smaller suburban markets (Danbury, Milford, Stratford, Hamden) clusters around \$215,000–\$291,000.
+At the bottom are Connecticut’s post-industrial cities (Bristol, Bridgeport, Meriden, Waterbury), with medians ranging from roughly \$125,000–\$183,000.
+
+The dashed statewide median line highlights an important pattern: eight of the twelve highest-volume towns actually sit below the statewide median, meaning that markets with the most transactions tend to be more affordable.
+This creates an interpretive challenge for statewide statistics—headline trends are driven by mid-market transactions and can mask very different dynamics in ultra-high-price markets like Greenwich and Fairfield versus more economically stressed urban centers such as Waterbury and Bridgeport.
+Stamford is a notable case: despite being Connecticut’s second-largest city, it has the third-highest median price at about \$475,000, indicating a sales market that is much closer to the high-price Fairfield County pattern than to other large cities in the state.
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+
+df <- dbReadTable(conn, "df")
+
+df <- df %>%
+  mutate(
+    Sale_Amount = as.numeric(Sale_Amount),
+    Assessed_Value = as.numeric(Assessed_Value)
+)
+
+topT <- df %>%
+  count(Town, sort = TRUE) %>%
+  slice_head(n = 12) %>%
+  pull(Town)
+
+df_med <- df %>%
+  filter(Town %in% topT) %>%
+  group_by(Town) %>%
+  summarise(
+    med = median(Sale_Amount, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+overall_med <- median(df$Sale_Amount, na.rm = TRUE)
+
+df_med %>%
+  ggplot(aes(y = reorder(Town, med), x = med)) +
+  geom_segment(aes(x = 0, xend = med, yend = Town),
+               linewidth = 1, color = "gray70") +
+  geom_point(size = 3) +
+  geom_text(aes(label = scales::dollar(med)),
+            hjust = -0.15, size = 3) +
+  scale_x_continuous(
+    labels = scales::dollar,
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  geom_vline(xintercept = overall_med, linetype = 2, color = "gray60") +
+  labs(
+    title= "Median Sale Amount (Top 12 Towns)",
+    subtitle = "Dashed line = overall median",
+    x = "Median Sale Amount",
+    y = "Town"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal()
+
+
+```
+
+Raw median prices tell part of the story, but examining how property types distribute across towns reveals different market structures.
+The stacked bar chart below breaks down total sales in the top ten towns by residential category.
+
+##### 3. Stacked Bar (Counts) – Sales by Property Type in Top Towns
+
+The chart compares total housing sales across Connecticut’s top towns and shows how each town’s activity breaks down by residential type.
+Single-family homes dominate in nearly every market, driving the majority of total sales volume.
+Condo transactions form a much larger share in coastal and commuter hubs like Stamford, Norwalk, and Greenwich, reflecting higher-density development and apartment conversions.
+In contrast, two- and three-family homes are more common in Bridgeport, Waterbury, and New Haven, where multi-family housing remains a core part of the urban stock.
+Four-family sales are rare across all towns.
+
+This breakdown highlights how housing composition—and therefore buyer demand—varies regionally.
+Markets anchored by single-family homes tend to reflect suburban preferences and owner occupancy, while towns with larger multi-family or condo segments show greater investment activity and housing diversity.
+
+Understanding these structural differences is key to interpreting how later shocks, such as the 2008 financial crisis or 2020 pandemic, affected different parts of the state unequally.
+Stamford's single-family-heavy market faces different pressures than Bridgeport's multi-family stock.
+When we later examine the 2008 crisis, we should expect coastal condo markets and urban multi-family markets to respond differently than suburban single-family towns.
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+
+src <- df %>% 
+  filter(!is.na(Residential_Type), trimws(Residential_Type) != "")
+
+# Top 10 towns by total housing transactions
+topT <- src %>% 
+  count(Town, name = "total") %>% 
+  arrange(desc(total)) %>% 
+  slice_head(n = 10) %>% 
+  pull(Town)
+
+# order towns by volume
+town_order <- src %>% 
+  filter(Town %in% topT) %>% 
+  count(Town, name = "total") %>% 
+  arrange(desc(total)) %>% 
+  pull(Town)
+
+# residential type levels + colors
+rt_levels <- c("Condo","Four Family","Single Family","Three Family","Two Family")
+pal <- res_palette[rt_levels]
+
+src %>%
+  filter(Town %in% topT) %>%
+  mutate(
+    Town = factor(Town, levels = town_order),
+    Residential_Type = fct_relevel(Residential_Type, rt_levels)
+  ) %>%
+  ggplot(aes(Town, fill = Residential_Type)) +
+  geom_bar() +
+  coord_flip() +
+  scale_fill_manual(values = pal, breaks = rt_levels, name = "Residential Type") +
+  labs(
+    title = "Sales Count by Residential Type in Top Towns (2001–2023)",
+    x = "Town", y = "Number of Sales"
+  ) +
+  theme_minimal(base_size = 10)
+
+
+```
+
+### Temporal Dynamics: Seasonality, Trends, and Economic Shocks
+
+Having established what properties exist and where they concentrate, we now examine when and how the market has changed over time.
+Real estate markets exhibit strong seasonal patterns, but these rhythms were disrupted by major economic events, most notably the 2008 financial crisis and the 2020 COVID-19 pandemic.
+
+##### 4. Heatmap – Seasonality of Sales by Month and Year
+
+The heatmap below shows the intensity of sales activity by month and year from 2001-2023.
+Darker tiles indicate higher transaction volumes.
+
+Across two decades of data, Connecticut’s housing market shows a clear seasonal rhythm: sales peak each summer (June–August), reflected in the dark blue and purple tiles, and slow down during the winter (January–March), shown in lighter yellow-green colors.
+
+The 2004–2005 period stands out as the height of Connecticut’s pre-crisis housing boom, with summer months turning deep purple as sales exceeded 8,000.
+The 2008–2009 financial crisis broke that pattern — summer peaks faded to mid-green tones, showing that even the busiest months had far fewer transactions.
+The weakness lingered through 2010–2012, when sales stayed moderate and the usual seasonal contrast nearly disappeared, indicating a sluggish recovery rather than an immediate rebound.
+
+A second disruption appears in 2020, during the COVID-19 pandemic.
+Early-spring months turn lighter, reflecting a sharp slowdown during lockdowns, but the second half of 2020 turns dark again as pent-up demand drove a strong rebound.
+By 2021–2023, the heatmap’s familiar pattern returns, dark summer bands and lighter winters, signaling that both crises were temporary shocks rather than permanent shifts in market behavior.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+# drop if it exists
+invisible(dbExecute(conn, "DROP TABLE IF EXISTS monthyear_counts;"))
+
+# create counts from real_estate_sales
+invisible(dbExecute(conn, '
+CREATE TABLE monthyear_counts AS
+WITH raw AS (
+  SELECT
+    CAST("List Year" AS INTEGER) AS Year,
+    -- month = part of Date.Recorded before the first "/"
+    CAST(
+      SUBSTR("Date Recorded", 1, INSTR("Date Recorded", "/") - 1)
+      AS INTEGER
+    ) AS MonthNum
+  FROM real_estate_sales
+  WHERE
+    "Date Recorded" IS NOT NULL
+    AND "List Year"   IS NOT NULL
+)
+SELECT
+  Year,
+  MonthNum,
+  COUNT(*) AS n
+FROM raw
+WHERE MonthNum BETWEEN 1 AND 12
+GROUP BY Year, MonthNum
+ORDER BY Year, MonthNum;
+'))
+
+df_monthyear <- dbReadTable(conn, "monthyear_counts")
+df_monthyear <- dbReadTable(conn, "monthyear_counts") %>%
+  mutate(
+    Month = factor(
+      month.abb[MonthNum],        
+      levels = month.abb
+    )
+  ) %>%
+  complete(
+    Year  = seq(min(Year, na.rm = TRUE), max(Year, na.rm = TRUE)),
+    Month = factor(month.abb, levels = month.abb),
+    fill  = list(n = 0)
+  ) %>%
+  mutate(Year = factor(Year, levels = seq(min(Year), max(Year))))
+
+ggplot(df_monthyear, aes(Month, Year, fill = n)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Sales", direction = -1, labels = scales::comma) +
+  labs(title = "Seasonality of Sales by Month and Year",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+```
+
+The heatmap revealed market-wide disruptions, but how did individual towns navigate the post-crisis recovery?
+The bubble chart below plots total sales volume against average sale price for each town during 2010-2020, with bubble size representing population.
+
+##### 5. Bubble Chart - Post-Crisis Market Structure (2010–2020)
+
+The bubble chart below visualizes how Connecticut towns performed during the post-crisis recovery.
+Each bubble represents a town, positioned by its total number of property sales (x-axis) and average sale price (y-axis) from 2010–2020, while bubble size reflects population.
+
+Overall, there’s a weak positive relationship between sales volume and average price, shown by the red dashed regression line—larger, more active markets tend to have slightly higher prices, but the relationship is far from strong.
+
+More striking is the contrast in market structure.
+The wealthiest towns, like Greenwich and Darien—cluster at the top-left, indicating extremely high prices but relatively low sales volumes and smaller populations.
+Meanwhile, larger urban centers such as Bridgeport and Stamford appear on the right, with much higher transaction counts but lower average prices.
+
+This pattern highlights a defining feature of Connecticut’s housing market: price concentration in low-density, high-value suburbs rather than in its largest cities.
+Unlike states where urban demand drives price premiums, Connecticut’s market strength comes from its affluent suburban enclaves.
+This suburban skew helps explain why economic shocks—like the 2008 financial crisis—affected Connecticut differently: the market’s resilience or vulnerability often depends more on these high-end, low-volume towns than on traditional urban housing centers.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+
+query_yearly_summary <- "
+  SELECT
+    Town,
+    COUNT(*) AS Total_Sales,
+    AVG(CAST(Sale_Amount AS REAL)) AS Avg_Sale_Price,
+    MAX(Population) AS Population
+  FROM df
+  WHERE CAST(List_Year AS INTEGER) BETWEEN 2010 AND 2020
+  GROUP BY Town;
+"
+yearly_summary <- dbGetQuery(conn, query_yearly_summary)
+
+top_sales_towns <- yearly_summary %>%
+  slice_max(order_by = Total_Sales, n = 2) %>%
+  pull(Town)
+
+top_price_towns <- yearly_summary %>%
+  slice_max(order_by = Avg_Sale_Price, n = 2) %>%
+  pull(Town)
+
+towns_to_label <- unique(c(top_sales_towns, top_price_towns))
+
+label_data <- yearly_summary %>%
+  filter(Town %in% towns_to_label)
+
+ggplot(yearly_summary, aes(
+  x = Total_Sales,
+  y = Avg_Sale_Price,
+  size = Population,
+  color = Town
+)) +
+  geom_point(alpha = 0.6) +
+  scale_size_area(max_size = 15) +
+  scale_y_continuous(labels = scales::dollar) +
+  geom_text(
+    data = label_data,
+    aes(label = Town),
+    size = 3, fontface = "bold",
+    vjust = -1, check_overlap = TRUE
+  ) +
+  geom_smooth(
+    method = "lm",
+    group = 1,
+    color = "red",
+    linetype = 2,
+    se = FALSE
+  ) +
+  labs(
+    title = "Connecticut Real Estate Market Overview (2010–2020)",
+    subtitle = "Sales Volume vs. Average Price by Town Population",
+    x = "Total Number of Sales (2010–2020)",
+    y = "Average Sale Price (2010–2020)",
+    size = "Town Population",
+    color = "Town"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+The bubble chart showed varied recovery trajectories, but how severe was the initial shock?
+The slope chart below examines the immediate impact of the 2008 financial crisis by comparing mean house prices in Connecticut's five most expensive towns in 2007 (pre-crisis) versus 2009 (mid-crisis).
+
+##### 6. Slope Chart - Great Recession Impact on High-End Markets (2007 vs 2009)
+
+The slope chart below captures how sharply Connecticut’s high-end housing market contracted during the Great Recession by comparing the mean sale prices of the state’s five most expensive towns—Greenwich, New Canaan, Darien, Westport, and Weston, between 2007 (pre-crisis) and 2009 (mid-crisis).
+
+Every line slopes downward, showing that even Connecticut’s most affluent markets were not immune to the nationwide housing collapse.
+New Canaan experienced the steepest drop, with average home prices falling by several hundred thousand dollars, while Darien and Westport saw more moderate declines.
+Greenwich, the state’s wealthiest town, retained the highest average price but still suffered a notable contraction, indicating that the luxury segment was hit just as severely in relative terms.
+
+This pattern underscores that the financial crisis did not only affect lower-value or speculative markets, it also eroded confidence and liquidity in high-end real estate, where transactions slowed and buyers became more cautious.
+The slope chart highlights both the magnitude and uniformity of the shock across elite suburban markets.
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+
+query_mean_prices <- "
+  SELECT
+    Town,
+    List_Year,
+    AVG(Sale_Amount) AS Mean_Sale_Amount
+  FROM df
+  WHERE List_Year IN (2007, 2009)
+  GROUP BY Town, List_Year;
+"
+
+mean_prices <- dbGetQuery(conn, query_mean_prices)
+
+top5 <- mean_prices %>%
+  filter(List_Year == 2007) %>%
+  arrange(desc(Mean_Sale_Amount)) %>%
+  slice_head(n = 5) %>%
+  pull(Town)
+
+slope_data <- mean_prices %>%
+  filter(Town %in% top5)
+
+# colors for top 5 towns
+town_colors_top5 <- setNames(master_palette[1:length(top5)], top5)
+
+ggplot(slope_data,
+       aes(x = factor(List_Year),
+           y = Mean_Sale_Amount,
+           group = Town,
+           color = Town)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_text(
+    data = subset(slope_data, List_Year == 2007),
+    aes(label = Town),
+    hjust = 1.2, size = 3.5, show.legend = FALSE
+  ) +
+  geom_text(
+    data = subset(slope_data, List_Year == 2009),
+    aes(label = Town),
+    hjust = -0.2, size = 3.5, show.legend = FALSE
+  ) +
+  scale_color_manual(values = town_colors_top5) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    title = "Mean House Prices of 5 Most Expensive Towns\nBefore and After the Great Recession",
+    x = "Year",
+    y = "Mean Sale Amount"
+  ) +
+  theme_minimal()
+
+
+```
+
+### Assessment Accuracy: Can Municipal Valuations Predict Market Prices?
+
+The dramatic price swings documented above raise a critical question for property taxation: did municipal assessments accurately track market values, or did they systematically over- or under-value properties during volatile periods?
+Connecticut towns conduct revaluations periodically (typically every 5 years), meaning assessments may lag real-time market changes.
+
+##### 7. Scatterplot - Scatterplot of Assessed Value vs. Sale Amount
+
+The scatterplot below displays 5,000 randomly sampled property transactions, plotting the natural log of assessed value against the natural log of sale price. Because both axes use log scales, the slope of the fitted regression line can be interpreted as an elasticity: the estimated coefficient shows how much sale prices increase, on average, for a 1% increase in assessed value. The strong upward trend indicates that assessed values are broadly proportional to market prices, but the widening spread at higher assessment levels reveals declining accuracy for more expensive homes. This pattern mirrors national findings, assessment systems tend to be most precise for mid-range properties and least precise in luxury markets. Overall, the log–log relationship confirms that assessments provide a reasonable benchmark for typical homes while also highlighting systematic under-assessment at the top end of the market.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+
+sample_query <- "
+  SELECT 
+    CAST(Sale_Amount AS REAL)    AS Sale_Amount,
+    CAST(Assessed_Value AS REAL) AS Assessed_Value
+  FROM df
+  WHERE Sale_Amount IS NOT NULL 
+    AND Assessed_Value IS NOT NULL
+    AND CAST(Sale_Amount AS REAL)    > 0
+    AND CAST(Assessed_Value AS REAL) > 0
+    AND CAST(Sale_Amount AS REAL)    <= 1000000
+    AND CAST(Assessed_Value AS REAL) <= 1000000
+  ORDER BY RANDOM()
+  LIMIT 5000;
+"
+
+sample_data <- dbGetQuery(conn, sample_query) %>%
+  mutate(
+    log_sale = log(Sale_Amount),
+    log_assessed = log(Assessed_Value)
+  )
+
+fit <- lm(log_sale ~ log_assessed, data = sample_data)
+
+ggplot(sample_data, aes(x = log_assessed, y = log_sale)) +
+  geom_point(alpha = 0.4, color = master_palette[1]) +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linewidth = 1) +
+  labs(
+    title = "Assessed Value vs. Sale Amount (Log–Log, Sampe of 5,000)",
+    subtitle = "Red line shows linear fit between log assessed and log sale prices",
+    x  = "log(Assessed Value)",
+    y = "log(Sale Amount)"
+  ) +
+  scale_x_continuous(limits = c( log(5000), log(1e6) )) +
+  scale_y_continuous(limits = c( log(5000), log(1e6) ))+
+  theme_minimal()
+
+
+```
+We now turn from this static view to ask how these dynamics have changed over time, focusing on two key episodes: the Great Recession (2007–2009) and the recent post-COVID boom.
+
+### Crisis and Boom: Connecticut Housing from 2007 to 2023
+
+##### 8. Line Plot – Median Sale Price Trends (2015–2023)
+
+The chart above tracks how median home prices have evolved across Connecticut’s three largest cities—Bridgeport, New Haven, and Stamford—since 2015.
+All three cities show strong upward trajectories, with particularly sharp growth after 2020.
+In Bridgeport and New Haven, three-family and two-family homes saw the steepest appreciation, more than doubling in median price since 2016, suggesting renewed investor and rental market activity.
+Stamford stands out for its consistently higher price levels: single-family homes now approach \$800K, nearly double Bridgeport’s top segment.
+The dashed line at 2020 marks the onset of COVID-19, after which prices accelerated across every property type, indicating that the pandemic triggered a statewide surge in housing demand rather than a downturn.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+real_estate_data <- dbReadTable(conn, "df") %>%
+  mutate(
+    Sale_Amount   = as.numeric(Sale_Amount),
+    Date_Recorded = as.Date(Date_Recorded)     
+  )
+
+# Define top towns
+top_towns <- c("Bridgeport", "New Haven", "Stamford")
+
+# Build plot data
+plot_data <- real_estate_data %>%
+  mutate(Year = year(Date_Recorded)) %>%
+  filter(
+    Town %in% top_towns,
+    !is.na(Year),
+    Year >= 2015 & Year <= 2023,
+    Residential_Type %in% c("Single Family", "Two Family", "Three Family", "Condo")
+  ) %>%
+  group_by(Town, Year, Residential_Type) %>%
+  summarise(
+    Median_Sale_Amount = median(Sale_Amount, na.rm = TRUE),
+    Count = n(),
+    .groups = "drop"
+  )
+
+ggplot(plot_data, aes(x = Year, y = Median_Sale_Amount, color = Residential_Type)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2020, linetype = "dashed", alpha = 0.5) +
+  facet_wrap(~ Town, scales = "free_y", ncol = 3) +
+  scale_y_continuous(
+    labels = dollar_format(prefix = "$", scale = 1e-3, suffix = "K"),
+    name = "Median Sale Price"
+  ) +
+  scale_color_brewer(
+    palette = "Set2",
+    name = "Property Type"
+  ) +
+  labs(
+    title = "Median Sale Prices by Residential Type in Top 3 CT Cities",
+    subtitle = "2015–2023, dashed line marks onset of COVID-19 (2020)",
+    x = "Year",
+    caption = "Source: CT Real Estate Sales 2001–2023 (GL)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray40", size = 10)
+  )
+
+
+```
+
+#### Impact of the Great Recession on Connecticut Housing Markets (2007–2009)
+
+While the line chart highlights post-2015 price movements across major cities, we also wanted to dig deeper into two key time periods using SQL: the 2008 financial crisis and the recent post-pandemic boom.
+By summarizing average sale prices and sales counts by year and property type, we can compare how sharply the Great Recession affected housing markets statewide and how different residential types have appreciated in recent years.
+
+##### Housing Market Contraction During the Great Recession (2007–2009)
+
+Given the slope chart illustrating a significant decrease in mean house price of the five most expensive towns in Connecticut, we wanted to explore the effects of the Great Recession on mean housing price for the rest of the towns in the dataset, as well as the change in sales from 2007 to 2009.
+
+The analysis of housing data from 115 towns between 2007 and 2009 clearly illustrates the negative impact of the Great Recession on Connecticut's real estate market.
+The average mean sale price across all towns dropped significantly from \$388,056 in 2007 to \$339,602 in 2009, corresponding to a mean price decline of -12.41% (median decline: -11.9%).
+This confirms that even when excluding the five most expensive towns, price depreciation was widespread.
+
+The severity of the downturn is highlighted by the worst-affected town, which saw a price drop of nearly -49.1%.
+Concurrently, sales activity also contracted, with the mean total number of sales falling from 1,949 to 1,824, resulting in an average sales volume change of -5.08%.
+
+While the majority of towns saw decreases in both price and sales volume, the presence of an extreme sales increase of +84.6% and a price appreciation of +14.8% in the maximum values suggests that certain local markets were either more resilient or experienced unusual transaction activity during the crisis period.
+The provided statistics, however, do not address the separate question regarding housing appreciation trends for different residential types over the most recent five years (2018-2023).
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+
+gr_summary_town <- df %>%
+  filter(
+    List_Year %in% c(2007, 2009),
+    !is.na(Sale_Amount)
+  ) %>%
+  mutate(
+    List_Year = as.integer(List_Year),
+    Sale_Amount = as.numeric(Sale_Amount)
+  ) %>%
+  group_by(Town, List_Year) %>%
+  summarise(
+    Total_Sales = n(),
+    Avg_Sale_Price = mean(Sale_Amount),
+    .groups = 'drop'
+  ) %>%
+  pivot_wider(
+    names_from = List_Year,
+    values_from = c(Avg_Sale_Price, Total_Sales),
+    names_sep = "_"
+  ) %>%
+  drop_na(Avg_Sale_Price_2007, Total_Sales_2007) %>%
+  mutate(
+    Percent_Change_Price = round(
+      (Avg_Sale_Price_2009 - Avg_Sale_Price_2007) / Avg_Sale_Price_2007, 3
+    ),
+    Percent_Change_Sales = round(
+      (Total_Sales_2009 - Total_Sales_2007) / Total_Sales_2007, 3
+    )
+  ) %>%
+  select(
+    Town,
+    Avg_Sale_Price_2007,
+    Avg_Sale_Price_2009,
+    Total_Sales_2007,
+    Total_Sales_2009,
+    Percent_Change_Price,
+    Percent_Change_Sales
+  ) %>%
+  drop_na(Percent_Change_Price, Percent_Change_Sales)
+
+print(gr_summary_town)
+```
+
+##### Housing Appreciation by Residential Type (2018–2023)
+
+To contrast the earlier period of decline, we also examined housing appreciation for different residential types over the five most recent years in the dataset.
+We filtered the data to 2018 and 2023 and grouped by residential type to evaluate appreciation trends.
+
+In sharp contrast, the period from 2018 to 2023 saw a massive market surge, with property appreciation far outpacing historical norms.
+Multi-family residential types (Three, Two, and Four Family homes) led this boom, experiencing phenomenal growth rates between +66.5% and +81.7%, driven by strong demand for rental and investment properties.
+Even Single Family homes appreciated by +64.0%, though Condos lagged behind with a still-strong +32.5% appreciation.
+
+This stark difference highlights a shift from a crisis-driven market contraction in 2007–2009 to a period of unprecedented expansion and high demand, particularly for multi-family units, in more recent years.
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+base_df <- df %>%
+  filter(
+    List_Year %in% c(2018, 2023),
+    !is.na(Sale_Amount),
+    !is.na(Residential_Type)
+  ) %>%
+  mutate(
+    List_Year = as.integer(List_Year),
+    Sale_Amount = as.numeric(Sale_Amount)
+  )
+
+agg_df <- base_df %>%
+  group_by(Residential_Type, List_Year) %>%
+  summarise(
+    Avg_Sale_Price = mean(Sale_Amount, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+house_appreciation <- agg_df %>%
+
+  pivot_wider(
+    names_from = List_Year,
+    values_from = Avg_Sale_Price,
+    names_prefix = "Avg_"
+  ) %>%
+
+  mutate(
+    Percent_Change_Price = round(
+      (Avg_2023 - Avg_2018) / Avg_2018, 3
+    )
+  ) %>%
+  select(
+    Residential_Type,
+    Avg_2018,
+    Avg_2023,
+    Percent_Change_Price
+  )
+ 
+print(house_appreciation)
+```
+
+### 9. Transaction Types and Market Distress: Mining Assessor Remarks
+
+In particular, the town-level and property-type summaries suggest that composition effects, what kinds of properties are selling, could be driving some of the extreme changes we observe.
+The preceding analysis documented steep price declines during the 2008 crisis and variation in assessment accuracy, but these patterns raise a deeper question: why did values fall so sharply?
+
+To investigate, we mined over 250,000 assessor and OPM remark fields for transaction keywords such as “foreclosure,” “short sale,” “estate sale,” and “bank owned.” This text-mining approach allows us to identify when and where non-standard, distressed sales occurred, revealing a hidden dimension of market stress.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+data <- data %>%
+  mutate(
+    Sale.Amount = as.numeric(Sale.Amount),
+    Assessed.Value = as.numeric(Assessed.Value)
+  )
+
+#identify remark columns (assessor + OPM)
+remark_cols <- grep("remark|Remark", colnames(data), value = TRUE, ignore.case = TRUE)
+assessor_col <- remark_cols[grep("assessor", remark_cols, ignore.case = TRUE)][1]
+opm_col <- remark_cols[grep("opm", remark_cols, ignore.case = TRUE)][1]
+
+#Identify transaction types using text mining ---
+transaction_data <- data %>%
+  filter(!is.na(.data[[assessor_col]]) | !is.na(.data[[opm_col]])) %>%
+  mutate(
+    remarks = tolower(paste(
+      ifelse(is.na(.data[[assessor_col]]), "", .data[[assessor_col]]),
+      ifelse(is.na(.data[[opm_col]]), "", .data[[opm_col]])
+    )),
+    is_foreclosure = str_detect(remarks, "foreclosure|foreclosed"),
+    is_short_sale = str_detect(remarks, "short sale"),
+    is_estate_sale = str_detect(remarks, "estate sale"),
+    is_bank_owned = str_detect(remarks, "bank owned|reo"),
+    is_new_construction = str_detect(remarks, "new construction|construction"),
+    is_private_sale = str_detect(remarks, "private sale"),
+    is_arms_length = str_detect(remarks, "arms length|arm's length"),
+    is_family_transfer = str_detect(remarks, "family|relative|gift"),
+    transaction_type = case_when(
+      is_foreclosure ~ "Foreclosure",
+      is_short_sale ~ "Short Sale",
+      is_estate_sale ~ "Estate Sale",
+      is_bank_owned ~ "Bank Owned",
+      is_new_construction ~ "New Construction",
+      is_family_transfer ~ "Family Transfer",
+      is_private_sale ~ "Private Sale",
+      TRUE ~ "Standard Sale"
+    )
+  )
+
+#Frequency of each transaction type
+transaction_summary <- transaction_data %>%
+  count(transaction_type, sort = TRUE) %>%
+  mutate(percentage = 100 * n / sum(n))
+
+price_by_transaction <- transaction_data %>%
+  filter(Property.Type == "Residential", Sale.Amount > 0, Sale.Amount < 2000000) %>%
+  group_by(transaction_type) %>%
+  summarize(
+    avg_price = mean(Sale.Amount, na.rm = TRUE),
+    median_price = median(Sale.Amount, na.rm = TRUE),
+    count = n(),
+    .groups = "drop"
+  )
+
+#4. Assessment-to-sale ratio by transaction type 
+assessment_by_transaction <- transaction_data %>%
+  filter(Property.Type == "Residential", Sale.Amount > 0, Sale.Amount < 2000000, Assessed.Value > 0) %>%
+  mutate(assessment_ratio = Assessed.Value / Sale.Amount) %>%
+  group_by(transaction_type) %>%
+  summarize(
+    avg_ratio = mean(assessment_ratio, na.rm = TRUE),
+    median_ratio = median(assessment_ratio, na.rm = TRUE),
+    count = n(),
+    .groups = "drop"
+  )
+
+
+```
+
+Most real estate transactions in Connecticut are standard, arm’s-length sales, accounting for roughly 96% of all records.
+Distressed or non-traditional sales, like foreclosures, short sales, or estate liquidations, represent only a small share overall, but their timing and concentration matter enormously.During stable market periods, these categories remain minimal, but when economic conditions deteriorate, their presence can expand quickly and influence market averages.
+
+The area chart below illustrates how this dynamic played out between 2001 and 2022.
+Distressed sales were nearly absent before 2007 but surged during the 2008–2010 housing crisis, when foreclosures and short sales spiked dramatically.
+Foreclosures alone jumped from fewer than 50 cases a year to nearly 1,800 by 2010, while short sales rose in parallel.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 4.5, fig.width = 6}
+
+#5. Yearly trend of distressed sales (2001–2022)
+foreclosure_trend <- transaction_data %>%
+
+  mutate(date = as.Date(Date.Recorded, format = "%m/%d/%Y")) %>% 
+
+  filter(!is.na(date)) %>%
+  mutate(year = as.numeric(format(date, "%Y"))) %>% 
+  filter(year >= 2001, year <= 2022) %>% 
+  group_by(year, transaction_type) %>%
+  summarize(count = n(), .groups = "drop")
+
+distressed_trend <- foreclosure_trend %>%
+  filter(transaction_type %in% c("Foreclosure", "Short Sale", "Bank Owned"))
+
+ggplot(distressed_trend, aes(x = year, y = count, fill = transaction_type)) +
+  geom_area(alpha = 0.8, position = "stack", color = "white") +
+  scale_fill_brewer(palette = "Set2", name = "Transaction Type") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  # Now this scale works correctly because 'year' is numeric
+  scale_x_continuous(breaks = seq(2001, 2022, 2)) +
+  labs(
+    title = "Distressed Property Sales Over Time in Connecticut",
+    subtitle = "Foreclosures and short sales surged during the 2008–2010 housing crisis",
+    x = "Year",
+    y = "Number of Transactions"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+These transactions declined steadily after 2012, signaling gradual market recovery, but smaller waves appeared later in the decade, reflecting lingering financial stress in certain regions.
+By the early 2020s, distressed activity had largely returned to pre-crisis levels.
+
+This pattern clarifies why the 2008 downturn was so severe in Connecticut.
+Average prices fell not only because market fundamentals weakened, but because a disproportionate share of properties sold under distress, often at steep discounts, pulling down overall price statistics.
+Even though these sales made up only a fraction of total transactions, their lower sale values exerted strong downward pressure on regional averages.
+
+Geographically, these effects were uneven. Urban centers such as Bridgeport, Hartford, Waterbury, and New Haven saw far higher shares of foreclosures and short sales compared to wealthier suburban towns.
+In contrast, affluent areas along the coast experienced few distressed transactions, insulating them from the worst of the market collapse. This uneven spatial distribution underscores how housing crises amplify existing inequalities: financial distress concentrates in already vulnerable communities, while higher-income regions remain relatively stable.
+
+In short, text mining of assessor remarks exposes how much transaction type composition shapes apparent market behavior. Distressed sales spike during crises, depress prices, and create ripple effects in tax assessments and neighborhood stability. Understanding when and where these sales occur is essential for distinguishing real declines in property value from temporary distortions caused by financial distress.
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 5, fig.width = 6}
+#6. Transaction type composition in top 10 towns
+top_towns <- data %>%
+  count(Town, sort = TRUE) %>%
+  head(10) %>%
+  pull(Town)
+
+town_transactions <- transaction_data %>%
+  filter(Town %in% top_towns) %>%
+  count(Town, transaction_type) %>%
+  group_by(Town) %>%
+  mutate(percentage = 100 * n / sum(n)) %>%
+  filter(transaction_type %in% c("Foreclosure", "Short Sale", "Estate Sale", "New Construction"))
+
+#7. Price discount compared to standard sales
+standard_price <- price_by_transaction %>%
+  filter(transaction_type == "Standard Sale") %>%
+  pull(avg_price)
+
+discount_analysis <- price_by_transaction %>%
+  mutate(
+    discount_from_standard = standard_price - avg_price,
+    discount_percentage = 100 * (standard_price - avg_price) / standard_price
+  )
+
+```
+
+### Killer Plot
+
+One of the main focal points of our projects was examining times of crisis in the housing market, particularly looking at the Great Recession, and seeing how specific factors of the market were subsequently affected. Our killer plot contains two comparisons in it, those being the percentage of standard sales to foreclosures, and the percentage of single family homes sold to multi family homes sold. 
+
+While our interactive plot implements a timeline function where each individual year can be clicked on from 2006 to 2023, our static model can only contain one year at a time. In this case, we chose the year 2008 in order to give a picture of the market during the Great Recession. In the graph, we can see a significant portion of red in the box, illustrating the high percentage of foreclosures in that year relative to other years. Additionally, the entire rectangle is somewhat small and does not fill up the entire screen, indicating that overall sales were low in 2008. It's also important to note that we decided to log the values for foreclosure percentage, as they were extremely low relative to the percentage of standard sales. We did this in order to make the foreclosure percentage more visible on our killer plot to more effectively show our findings, particularly during the Great Recession.
+
+As demonstrated by our killer plot, the ratio of foreclosures to standard sales as well as the total number of housing sales can greatly vary over time due to market fluctuations and housing crises like the Great Recession. Even in the years following the Great Recession, the foreclosure to standard sale ratio was still relatively high, indicating that the Great Recession had a strong impact on the market even after it had passed. Additionally, another key takeaway that we found from our killer plot was that the ratio of single family houses sold to multi family houses sold remained mostly constant from 2006-2023 even through all of the market fluctuations, which was surprising to us given the significant changes in foreclosures and standard sales.
+```{r, include=FALSE}
+library(tidyr)
+library(dplyr)
+library(grid)
+
+# Data Cleaning
+total_sales <- df %>%
+  mutate(List_Year = as.integer(List_Year)) %>%
+  group_by(List_Year) %>%
+  summarize(total_sales = n(), .groups = "drop")
+
+single_multi <- df %>%
+  mutate(
+    List_Year = as.integer(List_Year),
+    family_type = case_when(
+      Residential_Type == "Single Family" ~ "single",
+      Residential_Type %in% c("Two Family", "Three Family", "Four Family", "Condo") ~ "multi",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  group_by(List_Year, family_type) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = family_type, values_from = count, values_fill = 0)
+
+foreclosure_standard <- transaction_data %>%
+  mutate(List_Year = as.integer(List.Year)) %>%
+  group_by(List_Year) %>%
+  summarize(
+    foreclosures = sum(is_foreclosure, na.rm = TRUE),
+    standard_sales = sum(transaction_type == "Standard Sale", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Creating List of Years
+all_years <- data.frame(List_Year = 2006:2023)
+
+yearly <- all_years %>%
+  left_join(total_sales, by = "List_Year") %>%
+  left_join(single_multi, by = "List_Year") %>%
+  left_join(foreclosure_standard, by = "List_Year") %>%
+  mutate(
+    total_sales = replace_na(total_sales, 0),
+    single = replace_na(single, 0),
+    multi = replace_na(multi, 0),
+    foreclosures = replace_na(foreclosures, 0),
+    standard_sales = replace_na(standard_sales, 0)
+  ) %>%
+  arrange(List_Year)
+
+# Sale Calculations
+yearly <- yearly %>%
+  mutate(
+    side_raw = sqrt(total_sales),
+    pct_normal = ifelse(total_sales == 0, 0, standard_sales / total_sales),
+    pct_foreclosure = ifelse(total_sales == 0, 0, foreclosures / total_sales),
+    pct_single = ifelse(total_sales == 0, 0, single / total_sales),
+    pct_multi = ifelse(total_sales == 0, 0, multi / total_sales)
+  )
+
+# Variables for Killer Plot
+years           <- yearly$List_Year
+N               <- length(years)
+pct_normal      <- yearly$pct_normal
+pct_foreclosure <- yearly$pct_foreclosure
+pct_single      <- yearly$pct_single
+pct_multi       <- yearly$pct_multi
+
+# Create size ratio for rectangles
+max_side <- max(yearly$side_raw, na.rm = TRUE)
+if(max_side == 0) max_side <- 1
+side <- yearly$side_raw / max_side * 0.09 
+
+# Log foreclosure values to make more visible
+raw_log <- log10(pct_foreclosure + 0.001)
+
+t_min <- 0.02
+t_max <- 0.40
+
+d_min <- min(raw_log, na.rm = TRUE)
+d_max <- max(raw_log, na.rm = TRUE)
+
+if (d_max == d_min) {
+  fo_vis <- rep(t_min, length(raw_log))
+} else {
+  fo_vis <- (raw_log - d_min) / (d_max - d_min) * (t_max - t_min) + t_min
+}
+
+fo_vis  <- pmin(fo_vis, t_max)
+fo_vis  <- pmax(fo_vis, t_min)
+
+pct_foreclosure_vis <- fo_vis
+pct_normal_vis      <- 1 - pct_foreclosure_vis
+```
+
+```{r}
+drawBreakdownBox <- function(selected_year = NULL, breakdown_clicked = TRUE) {
+    if (is.null(selected_year)) return()
+    
+    i <- which(years == selected_year)
+    if (length(i) == 0) return()
+
+    current_standard_sales <- yearly$standard_sales[i]
+    current_foreclosures <- yearly$foreclosures[i]
+    
+    grid.newpage()
+    leg_y <- 0.97
+    box_sz <- 0.045
+    
+    # Create a Legend
+    grid.rect(x = 0.08, y = leg_y, width = box_sz, height = box_sz, 
+              gp = gpar(fill = "forestgreen", col = NA))
+    grid.text("Standard Sale", x = 0.08 + box_sz/2 + 0.01, y = leg_y, just = "left", 
+              gp = gpar(fontsize = 12, col="grey30"))
+    
+    grid.rect(x = 0.28, y = leg_y, width = box_sz, height = box_sz, 
+              gp = gpar(fill = "red3", col = NA))
+    grid.text("Foreclosure", x = 0.28 + box_sz/2 + 0.01, y = leg_y, just = "left", 
+              gp = gpar(fontsize = 12, col="grey30"))
+    grid.rect(x = 0.52, y = leg_y, width = box_sz, height = box_sz, 
+              gp = gpar(fill = "orange", col = NA))
+    grid.text("Single Family", x = 0.52 + box_sz/2 + 0.01, y = leg_y, just = "left", 
+              gp = gpar(fontsize = 12, col="grey30"))
+              
+    grid.rect(x = 0.75, y = leg_y, width = box_sz, height = box_sz, 
+              gp = gpar(fill = "purple", col = NA))
+    grid.text("Multi Family", x = 0.75 + box_sz/2 + 0.01, y = leg_y, just = "left", 
+              gp = gpar(fontsize = 12, col="grey30"))
+    
+    pushViewport(viewport(x = 0.4, y = 0.5, width = 0.8, height = 1)) 
+    
+    X_MARGIN_OFFSET <- 0.02 
+    VERTICAL_SHIFT <- 0.05 
+
+    # Creating the main bar
+    bar_height <- 0.35 
+    proportional_width <- side[i] * 10
+    
+    green_width <- proportional_width * pct_normal_vis[i]
+    red_width <- proportional_width * pct_foreclosure_vis[i]
+
+    total_bar_width <- green_width + red_width
+    left_edge <- 0.5 - total_bar_width / 2
+    main_bar_y <- 0.5 + VERTICAL_SHIFT 
+
+    # Green block (Normal Sales)
+    grid.rect(
+        x = left_edge + green_width/2, y = main_bar_y, width = green_width,
+        height = bar_height, gp = gpar(fill = "forestgreen", col = "black")
+    )
+
+    # Red block (Foreclosures)
+    grid.rect(
+        x = left_edge + green_width + red_width/2, y = main_bar_y, width = red_width,
+        height = bar_height, gp = gpar(fill = "red3", col = "black")
+    )
+    
+    # Labels
+    grid.text(
+        paste0(format(round(current_standard_sales), big.mark = ","), " Units"), 
+        x = left_edge + green_width/2, 
+        y = main_bar_y + bar_height/2 + 0.06, 
+        just = "center", gp = gpar(col = "forestgreen", fontface = "bold", cex=1.2)
+    )
+    grid.text(
+        paste0(format(round(current_foreclosures), big.mark = ","), " Units"), 
+        x = left_edge + green_width + red_width/2, 
+        y = main_bar_y + bar_height/2 + 0.06, 
+        just = "center", gp = gpar(col = "red3", fontface = "bold", cex=1.2)
+    )
+    
+    # Clicked bar
+    if (breakdown_clicked) {
+        breakdown_height <- 0.2 
+        total_breakdown_width <- total_bar_width 
+
+        pct_single_raw <- pct_single[i]
+        pct_multi_raw <- pct_multi[i]
+        total_raw_pct <- pct_single_raw + pct_multi_raw
+        
+        if (total_raw_pct > 0) {
+            single_width <- total_breakdown_width * (pct_single_raw / total_raw_pct)
+            multi_width <- total_breakdown_width * (pct_multi_raw / total_raw_pct)
+        } else {
+            single_width <- 0
+            multi_width <- 0
+        }
+        
+        breakdown_gap <- 0.05 
+        breakdown_y <- (main_bar_y - bar_height / 2) - breakdown_gap - (breakdown_height / 2)
+        breakdown_left_edge <- 0.5 - total_breakdown_width / 2
+
+        # Orange block (Single Family)
+        grid.rect(
+            x = breakdown_left_edge + single_width/2, y = breakdown_y, 
+            width = single_width, height = breakdown_height, 
+            gp = gpar(fill = "orange", col = "black")
+        )
+
+        # Purple block (Multi Family)
+        grid.rect(
+            x = breakdown_left_edge + single_width + multi_width/2, y = breakdown_y, 
+            width = multi_width, height = breakdown_height, 
+            gp = gpar(fill = "purple", col = "black")
+        )
+        
+        Y_text_bottom <- breakdown_y - breakdown_height / 2
+        TEXT_BUFFER <- 0.06 
+        
+        # Labels
+        grid.text(
+            paste0(round(pct_single[i] * 100, 1), "% Single"), 
+            x = breakdown_left_edge + single_width/2, 
+            y = Y_text_bottom - TEXT_BUFFER,
+            just = "center", gp = gpar(col = "orange", fontface = "bold", cex=1.2)
+        )
+        grid.text(
+            paste0(round(pct_multi[i] * 100, 1), "% Multi"), 
+            x = breakdown_left_edge + single_width + multi_width/2, 
+            y = Y_text_bottom - TEXT_BUFFER,
+            just = "center", gp = gpar(col = "purple", fontface = "bold", cex=1.2)
+        )
+    }
+
+    popViewport()
+}
+```
+
+
+```{r, echo = FALSE, warning=FALSE, fig.align ='center', fig.height = 3, fig.width = 8}
+# Example: Draw visualization for year 2008
+drawBreakdownBox(selected_year = 2008, breakdown_clicked = TRUE)
+```
+
+
+# III: Preliminary Statistical Modeling & Hypothesis Testing
+
+We formalize our findings using regression analysis to test whether Connecticut’s assessment system fails systematically. Our baseline model confirms that assessed values generally predict sale prices well, explaining 74% of price variation (R² = 0.74). The elasticity of 0.89 indicates that a 10% increase in assessed value corresponds to an 8.9% increase in sale price. Log transformation is used to address the right-skewed distribution of housing prices, a standard approach in real estate analysis.
+
+Testing H1: Do assessments fail during volatile periods? Using a 200,000-transaction random subsample drawn from the full dataset of more than 6 million sales, we compare assessment error—defined as the log difference between sale price and assessed value—across three market periods. Mean error is 0.628 during the Pre-Crisis period (2001–2007), meaning homes sold for roughly 87% above assessment. During Post-2008 (2008–2019), error drops to 0.282, or about 33% above assessment, before rising again to 0.625 in the Post-COVID market (2020–2023), again roughly 87% above assessment. Statistical testing confirms these differences are significant (p < 0.001). This pattern highlights how Connecticut’s 5–10 year revaluation cycle lags market conditions: assessments overstated values during the recession and understated them during the COVID-era boom. H1 is strongly supported.
+
+Testing H2: Are expensive homes under-assessed? Quantile regressions on the same sample reveal that assessment accuracy declines systematically as property values increase. At the 25th percentile, elasticity is 0.993, indicating near one-to-one correspondence between assessed and market values. At the median, elasticity falls to 0.944, and at the 75th percentile it further declines to 0.905. This means a 10% increase in assessed value translates to about a 9.9% increase in sale price for lower-value homes but only about a 9.0% increase for higher-value homes. Expensive properties therefore sell for more relative to their assessments than cheaper properties, shifting tax burden downward. H2 is strongly supported.
+
+Overall, our results show that Connecticut’s assessment system performs reasonably well for typical homes in stable markets but fails systematically during volatile periods and for high-value properties—the contexts where accuracy matters most for fiscal equity and municipal revenue stability. These findings motivate the deeper modeling and policy evaluation that follow, demonstrating that the system’s limitations are structural rather than incidental and require more adaptive approaches to revaluation.
+
+```{r, include=FALSE, warning=FALSE, message=FALSE}
+library(dplyr)
+library(lubridate)
+library(quantreg)
+library(broom)
+library(purrr)
+
+set.seed(123)
+
+#PREPARE DATA
+df_model <- df %>%
+  filter(
+    !is.na(Sale_Amount), !is.na(Assessed_Value),
+    Sale_Amount > 0, Assessed_Value > 0,
+    !is.na(Date_Recorded)
+  ) %>%
+  mutate(
+    Sale_Amount    = as.numeric(Sale_Amount),
+    Assessed_Value = as.numeric(Assessed_Value),
+    log_sale       = log(Sale_Amount),
+    log_assessed   = log(Assessed_Value),
+    Date_Recorded  = as.Date(Date_Recorded),
+    Year           = year(Date_Recorded),
+    Period = case_when(
+      Year <= 2007 ~ "Pre-Crisis (2001–2007)",
+      Year <= 2019 ~ "Post-2008 (2008–2019)",
+      TRUE         ~ "Post-COVID (2020–2023)"
+    ),
+    Period = factor(
+      Period,
+      levels = c("Pre-Crisis (2001–2007)",
+                 "Post-2008 (2008–2019)",
+                 "Post-COVID (2020–2023)")
+    ),
+    # Assessment error (positive = sold ABOVE assessment)
+    error = log_sale - log_assessed
+  )
+
+# Sample for faster modeling
+df_sample <- df_model %>% sample_n(200000)
+
+
+# MODEL A — BASELINE log_sale ~ log_assessed + type
+model_A <- lm(log_sale ~ log_assessed + Property_Type, data = df_sample)
+
+A_r2 <- summary(model_A)$r.squared
+A_elasticity <- coef(model_A)["log_assessed"]
+
+A_pct_interp <- A_elasticity * 10   # percent change for 10% up in assessment
+
+
+# MODEL B — H1: error ~ Period
+model_B <- lm(error ~ Period + Property_Type, data = df_sample)
+
+# Mean error by period
+error_by_period <- df_model %>%
+  group_by(Period) %>%
+  summarise(
+    mean_error = mean(error),
+    median_error = median(error),
+    n = n(),
+    .groups = "drop"
+  )
+
+# Percent increase from baseline
+error_pre  <- error_by_period$mean_error[1]
+error_post <- error_by_period$mean_error[2]
+error_covid <- error_by_period$mean_error[3]
+
+pct_increase_post  <- (error_post - error_pre) / error_pre
+pct_increase_covid <- (error_covid - error_pre) / error_pre
+
+# t-test: Pre vs Post-2008
+t_test_H1 <- t.test(
+  error ~ Period,
+  data = df_sample %>% filter(Period %in% c("Pre-Crisis (2001–2007)", "Post-2008 (2008–2019)"))
+)
+
+# MODEL C — H2: Quantile regressions
+
+taus <- c(0.25, 0.5, 0.75)
+
+qr_models <- map(taus, ~ rq(log_sale ~ log_assessed + Property_Type,
+                            tau = .x, data = df_sample))
+
+qr_summaries <- map(qr_models, ~ summary(.x, se="nid"))
+
+qr_results <- map2_dfr(
+  qr_summaries, taus,
+  ~ {
+    cf <- .x$coefficients["log_assessed", ]
+    tibble(
+      Quantile    = .y,
+      Elasticity  = cf["Value"],
+      Std_Error   = cf["Std. Error"],
+      t_value     = cf["t value"],
+      p_value     = cf["Pr(>|t|)"],
+      CI_Lower_95 = cf["Value"] - 1.96 * cf["Std. Error"],
+      CI_Upper_95 = cf["Value"] + 1.96 * cf["Std. Error"]
+    )
+  }
+)
+
+# print(error_by_period)
+# print(qr_results)
+
+
+```
+
+# IV: Conclusion & Future Work
+
+This project looked at how well Connecticut’s property assessment system reflects real market conditions using more than six million sales from 2001–2023. Overall, we found that assessments work reasonably well when the housing market is stable, but they fall behind during periods of rapid change. In both the 2008 housing crisis and the post-2020 boom, homes sold far above their assessed values, showing that the 5–10 year revaluation cycle simply cannot keep up with sudden shifts in prices, demand, or lending conditions. As a result, many homeowners end up paying taxes based on outdated values, which can create unexpected financial pressures.
+
+We also found that the basic structure of Connecticut’s housing market hasn’t changed much over time. Single-family homes have consistently dominated sales, so most of these market shocks happen within the same general type of housing. At the same time, assessments become less accurate as property values increase: high-value homes tend to be under-assessed compared to typical ones. This can shift more of the tax responsibility onto mid-value homeowners and create uneven effects across towns. Taken together, the results show that the system’s issues aren’t random—they follow clear patterns tied to how fast the market moves and where property values sit in the price range.
+
+There are several ways this analysis could be expanded. Adding information on mortgage rates, foreclosure patterns, or neighborhood characteristics could help explain why some areas experience larger assessment gaps than others. It would also be useful to look more closely at condos and small multifamily properties to understand how assessment accuracy varies across different types of housing. Another important step is to test what would happen if Connecticut changed its revaluation schedule—whether by updating assessments more often, using automated tools to adjust values between cycles, or focusing on fast-changing areas. Exploring these options could help identify practical ways to make the assessment system more accurate, fair, and responsive during future housing cycles.
+
+## References
+
+Connecticut Data <https://data.ct.gov/Housing-and-Development/Real-Estate-Sales-2001-2023-GL/5mzw-sjtu/about_data> <https://data.ct.gov/Government/CT-2020-Population-Projections-by-Town/spwv-a9en/about_data> <https://data.ct.gov/Tax-and-Revenue/Personal-Income-Tax-By-Town-2011-2020/pvqv-e235/about_data>
